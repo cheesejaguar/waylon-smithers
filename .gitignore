@@ -2,3 +2,7 @@ node_modules
 .DS_Store
 .codex/waylon-smithers
 dist
+coverage/
+junit.xml
+# Workflow file cannot be pushed via GitHub App - add manually
+.github/
