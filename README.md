@@ -1,8 +1,8 @@
-# waylon-smithers
+# 🤖 waylon-smithers
 
 Dutiful Codex CLI loop wrapper inspired by the Ralph Wiggum pattern. Runs `codex exec` repeatedly, resumes the same session between iterations, and stops on a completion promise, HARD STOP marker, max-iteration cap, or user cancel.
 
-## Quick start
+## 🚀 Quick start
 
 ```bash
 npm install
@@ -13,7 +13,7 @@ npx waylon-smithers \
   --todo-file TODO.md
 ```
 
-## Ralph Wiggum mode
+## 🔄 Ralph Wiggum mode
 
 Use `--same-prompt-each-iteration` to replicate the original Ralph Wiggum pattern where the same full prompt is used every iteration (file state changes, but the prompt doesn't):
 
@@ -25,7 +25,7 @@ npx waylon-smithers \
   --same-prompt-each-iteration
 ```
 
-## Philosophy (Ralph Wiggum pattern)
+## 💡 Philosophy (Ralph Wiggum pattern)
 
 This tool implements the Ralph Wiggum iteration pattern:
 
@@ -35,7 +35,7 @@ This tool implements the Ralph Wiggum iteration pattern:
 - **Persistence Wins**: Keep trying until success. The loop handles retry logic automatically.
 - **Operator Skill Matters**: Success depends on writing good prompts, not just having a good model.
 
-## How it works
+## ⚙️ How it works
 
 Each iteration:
 - Iteration 1 runs `codex exec "<prompt>" --json --output-last-message <file>`
@@ -43,7 +43,7 @@ Each iteration:
 - Last messages are captured to `.codex/waylon-smithers/loops/<loop-id>/last_message_iter_<n>.txt`
 - State persists in `.codex/waylon-smithers/loops/<loop-id>.json` so you can resume later
 
-## Primary command
+## 📋 Primary command
 
 ```bash
 waylon-smithers "<PROMPT>" [options]
@@ -80,7 +80,7 @@ waylon-smithers "<PROMPT>" [options]
 | `--last-message-dir <path>` | per-loop dir | Override where last messages are stored |
 | `--summary-json <path>` | per-loop dir | Write a rolling summary JSON |
 
-### Checkpoints
+### 🛑 Checkpoints
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -88,7 +88,7 @@ waylon-smithers "<PROMPT>" [options]
 | `--hard-stop-token <text>` | `HARD STOP` | Token that triggers pause |
 | `--hard-stop-mode <pause\|exit>` | `pause` | Behavior when HARD STOP found |
 
-## Utility commands
+## 🔧 Utility commands
 
 - `waylon-smithers list [--cd <path>] [--json]` — list all loops in the workspace
 - `waylon-smithers status --loop-id <id>` — dump the current state JSON
@@ -96,7 +96,7 @@ waylon-smithers "<PROMPT>" [options]
 - `waylon-smithers cancel --loop-id <id> [--cleanup-artifacts]` — mark canceled and optionally delete loop artifacts
 - `waylon-smithers install-helpers` — install custom prompt and skill helpers
 
-## Prompt writing best practices
+## ✍️ Prompt writing best practices
 
 ### 1. Clear completion criteria
 
@@ -169,7 +169,7 @@ After 15 iterations, if not complete:
 - Suggest alternative approaches
 ```
 
-## When to use
+## ✅ When to use
 
 **Good for:**
 - Well-defined tasks with clear success criteria
@@ -183,7 +183,7 @@ After 15 iterations, if not complete:
 - Tasks with unclear success criteria
 - Production debugging (use targeted debugging instead)
 
-## Completion detection
+## 🎯 Completion detection
 
 Promise modes use the last message from each iteration:
 - `tag` (default): looks for `<promise>TEXT</promise>`
@@ -192,13 +192,13 @@ Promise modes use the last message from each iteration:
 
 When a promise is detected, the loop stops and marks the state as `completed`. Hitting `--max-iterations` marks `stopped_max_iterations`. HARD STOP tokens mark `paused_hard_stop` and, in pause mode, prompt for human confirmation.
 
-## Safety defaults
+## 🔒 Safety defaults
 
 - Sandbox defaults to `read-only`; approvals default to `on-request`
 - Dangerous settings (`--sandbox danger-full-access` or `--ask-for-approval never`) print a warning banner
 - Ctrl+C saves state as `paused_user_interrupt` so you can resume
 
-## Layout
+## 📁 Layout
 
 - State: `.codex/waylon-smithers/loops/<loop-id>.json`
 - Artifacts: `.codex/waylon-smithers/loops/<loop-id>/`
@@ -206,7 +206,7 @@ When a promise is detected, the loop stops and marks the state as `completed`. H
   - `events_iter_<n>.jsonl` (when `--jsonl-events` is set)
   - `summary.json`
 
-## Examples
+## 📚 Examples
 
 ### Basic test fixation loop
 
@@ -250,13 +250,13 @@ waylon-smithers \
   --same-prompt-each-iteration
 ```
 
-## Inspiration
+## 🙏 Inspiration
 
 Based on the Ralph Wiggum loop pattern used in Claude Code (`plugins/ralph-wiggum`), adapted for Codex CLI non-interactive mode and session resume support.
 
 Key insight from Ralph: "The prompt never changes between iterations; only the file state changes as the agent autonomously improves based on previous work."
 
-## References
+## 📖 References
 
 - [Ralph Wiggum technique](https://ghuntley.com/ralph/)
 - [Claude Code ralph-wiggum plugin](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum)
