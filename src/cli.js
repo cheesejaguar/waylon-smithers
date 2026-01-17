@@ -12,6 +12,7 @@ const DEFAULT_SANDBOX = "read-only";
 const DEFAULT_APPROVAL = "on-request";
 const DEFAULT_HARD_STOP_TOKEN = "HARD STOP";
 const DEFAULT_HARD_STOP_MODE = "pause";
+const DEFAULT_SAME_PROMPT_EACH_ITERATION = false;
 
 let currentChild = null;
 let sigintReceived = false;
@@ -103,13 +104,21 @@ function buildPromptTemplate({
     "Task:",
     userPrompt.trim(),
     "",
+    "Iteration philosophy (Ralph Wiggum pattern):",
+    "- You have access to your own previous work in the files and git history.",
+    "- Each iteration refines the codebase based on what you observe.",
+    "- Iteration > perfection: don't aim for perfect on the first try; let the loop refine your work.",
+    "- Failures are data: use test/lint failures to inform the next iteration.",
+    "- Read your previous output and commit history to understand what has been done.",
+    "",
     "Rules:",
     promiseRule,
     "If blocked, output a short BLOCKED section with what is needed to proceed.",
     "Prefer deterministic verification steps (tests, linters, typechecks) before claiming completion.",
+    "After verifying, if any check fails, fix the issue and verify again in this same iteration if possible.",
     ...todoRules,
     "",
-    "When you are certain the task is complete, output ONLY the completion promise token on its own line.",
+    "When you are certain the task is complete and all verification passes, output ONLY the completion promise token on its own line.",
   ].join("\n");
 }
 
@@ -340,6 +349,7 @@ function createInitialState({
   todoFile,
   hardStopToken,
   hardStopMode,
+  samePromptEachIteration,
   codexOptions,
 }) {
   return {
@@ -351,6 +361,7 @@ function createInitialState({
     completion_promise: completionPromise,
     promise_mode: promiseMode,
     max_iterations: maxIterations,
+    same_prompt_each_iteration: samePromptEachIteration,
     iteration: 0,
     status: "running",
     codex: {
@@ -432,6 +443,7 @@ async function runLoop({
   completionPromise,
   promiseMode,
   maxIterations,
+  samePromptEachIteration,
   artifactsDir,
   summaryJson,
   jsonlEventsBase,
@@ -466,25 +478,28 @@ async function runLoop({
     ensureDirFor(lastMessagePath);
     if (jsonlPath) ensureDirFor(jsonlPath);
 
-    const prompt =
-      state.codex.session_id == null
-        ? buildPromptTemplate({
-            loopId: state.loop_id,
-            iteration,
-            maxIterations,
-            promiseMode,
-            completionPromise,
-            userPrompt: state.prompt,
-            todoFile,
-            hardStopToken,
-          })
-        : buildContinuePrompt({
-            loopId: state.loop_id,
-            iteration,
-            maxIterations,
-            promiseMode,
-            completionPromise,
-          });
+    // When samePromptEachIteration is true (Ralph Wiggum mode), always use the full prompt.
+    // Otherwise, use the full prompt only for the first iteration and a shorter continue prompt
+    // for subsequent iterations.
+    const useFullPrompt = state.codex.session_id == null || samePromptEachIteration;
+    const prompt = useFullPrompt
+      ? buildPromptTemplate({
+          loopId: state.loop_id,
+          iteration,
+          maxIterations,
+          promiseMode,
+          completionPromise,
+          userPrompt: state.prompt,
+          todoFile,
+          hardStopToken,
+        })
+      : buildContinuePrompt({
+          loopId: state.loop_id,
+          iteration,
+          maxIterations,
+          promiseMode,
+          completionPromise,
+        });
 
     console.log(
       `\n--- Waylon-Smithers iteration ${iteration}/${maxIterations} (loop ${state.loop_id}) ---`
@@ -620,6 +635,8 @@ async function handleStart(prompt, options) {
 
   const codexOptions = buildCodexOptions(options, workspaceRoot);
   const todoFile = options.todoFile ? path.resolve(workspaceRoot, options.todoFile) : null;
+  const samePromptEachIteration =
+    options.samePromptEachIteration ?? DEFAULT_SAME_PROMPT_EACH_ITERATION;
   const initialState = createInitialState({
     loopId,
     workspaceRoot,
@@ -634,6 +651,7 @@ async function handleStart(prompt, options) {
     todoFile,
     hardStopToken: options.hardStopToken || DEFAULT_HARD_STOP_TOKEN,
     hardStopMode: options.hardStopMode || DEFAULT_HARD_STOP_MODE,
+    samePromptEachIteration,
     codexOptions,
   });
 
@@ -647,6 +665,7 @@ async function handleStart(prompt, options) {
     completionPromise: initialState.completion_promise,
     promiseMode: initialState.promise_mode,
     maxIterations: initialState.max_iterations,
+    samePromptEachIteration: initialState.same_prompt_each_iteration,
     artifactsDir,
     summaryJson,
     jsonlEventsBase,
@@ -682,6 +701,9 @@ async function handleResume(options) {
   if (options.promiseMode) {
     state.promise_mode = options.promiseMode;
   }
+  if (options.samePromptEachIteration !== undefined) {
+    state.same_prompt_each_iteration = options.samePromptEachIteration;
+  }
 
   const codexOptions = buildCodexOptions(options, workspaceRoot);
   state.codex.model = codexOptions.model;
@@ -697,6 +719,7 @@ async function handleResume(options) {
     completionPromise: state.completion_promise,
     promiseMode: state.promise_mode,
     maxIterations: state.max_iterations,
+    samePromptEachIteration: state.same_prompt_each_iteration ?? DEFAULT_SAME_PROMPT_EACH_ITERATION,
     artifactsDir,
     summaryJson,
     jsonlEventsBase,
@@ -712,6 +735,65 @@ function handleStatus(options) {
   const statePath = resolveStatePath(options.loopId, options.stateFile, workspaceRoot);
   const state = loadState(statePath);
   console.log(JSON.stringify(state, null, 2));
+}
+
+function handleList(options) {
+  const workspaceRoot = path.resolve(options.cd || process.cwd());
+  const loopsDir = path.resolve(workspaceRoot, ".codex/waylon-smithers/loops");
+
+  if (!fs.existsSync(loopsDir)) {
+    console.log("No loops found.");
+    return;
+  }
+
+  const files = fs.readdirSync(loopsDir).filter((f) => f.endsWith(".json"));
+  if (files.length === 0) {
+    console.log("No loops found.");
+    return;
+  }
+
+  const loops = [];
+  for (const file of files) {
+    const filePath = path.join(loopsDir, file);
+    try {
+      const state = readJson(filePath);
+      loops.push({
+        loop_id: state.loop_id,
+        status: state.status,
+        iteration: state.iteration,
+        max_iterations: state.max_iterations,
+        created_at: state.created_at,
+        updated_at: state.updated_at,
+        completion_promise: state.completion_promise,
+        same_prompt_each_iteration: state.same_prompt_each_iteration || false,
+      });
+    } catch (err) {
+      // Skip malformed state files
+    }
+  }
+
+  if (loops.length === 0) {
+    console.log("No valid loop state files found.");
+    return;
+  }
+
+  // Sort by updated_at descending (most recent first)
+  loops.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+
+  if (options.json) {
+    console.log(JSON.stringify(loops, null, 2));
+  } else {
+    console.log("Loops in this workspace:\n");
+    for (const loop of loops) {
+      const modeLabel = loop.same_prompt_each_iteration ? " [ralph]" : "";
+      console.log(`  ${loop.loop_id}${modeLabel}`);
+      console.log(`    Status: ${loop.status}`);
+      console.log(`    Iteration: ${loop.iteration}/${loop.max_iterations}`);
+      console.log(`    Promise: ${loop.completion_promise}`);
+      console.log(`    Updated: ${loop.updated_at}`);
+      console.log("");
+    }
+  }
 }
 
 function deleteArtifacts(artifactsDir, statePath) {
@@ -761,12 +843,28 @@ function renderSkillHelper(completionPromise) {
     "## When to use",
     "- Long-running tasks that need many iterations",
     "- Test/lint fixation loops",
+    "- Greenfield projects where you can walk away",
+    "- Tasks requiring iteration and refinement (e.g., getting tests to pass)",
+    "",
+    "## Philosophy (Ralph Wiggum pattern)",
+    "- Iteration > perfection: don't aim for perfect on first try; let the loop refine your work.",
+    "- Failures are data: use test/lint failures to inform the next iteration.",
+    "- You have access to your own previous work in files and git history.",
+    "- Read your previous output and commit history to understand what's been done.",
+    "- Persistence wins: keep trying until success.",
     "",
     "## Rules",
     `- Output <promise>${completionPromise}</promise> only when the task is fully complete and validated.`,
     "- If blocked, write a short BLOCKED section with what is needed.",
-    "- Prefer deterministic checks (tests, linters, typechecks).",
+    "- Prefer deterministic checks (tests, linters, typechecks) before claiming completion.",
+    "- After verifying, if any check fails, fix the issue and verify again.",
     "- Stop at HARD STOP markers in TODO files and ask for review.",
+    "",
+    "## Best practices for prompts",
+    "- Set clear completion criteria with specific verification steps.",
+    "- Break complex tasks into incremental goals.",
+    "- Include self-correction: write tests, run them, fix failures, repeat.",
+    "- Always set a reasonable --max-iterations as a safety net.",
   ].join("\n");
 }
 
@@ -819,6 +917,20 @@ program
   });
 
 program
+  .command("list")
+  .description("List all loops in the workspace")
+  .option("--cd <path>", "Workspace root to scan for loops")
+  .option("--json", "Output as JSON", false)
+  .action((opts) => {
+    try {
+      handleList(opts);
+    } catch (err) {
+      console.error(`Failed to list loops: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+program
   .command("cancel")
   .description("Cancel a running loop and optionally remove artifacts")
   .requiredOption("--loop-id <id>", "Loop id to cancel")
@@ -843,6 +955,7 @@ program
   .option("--max-iterations <n>", "Override the stored max iterations", parseInteger)
   .option("--completion-promise <text>", "Override the completion promise")
   .option("--promise-mode <mode>", "Override promise detection mode (tag|plain|regex)")
+  .option("--same-prompt-each-iteration", "Use full prompt every iteration (Ralph Wiggum mode)")
   .option("--jsonl-events <path>", "Where to store JSONL event streams for resumed runs")
   .option("--model <model>", "Codex model override")
   .option("--profile <profile>", "Codex profile name")
@@ -886,6 +999,11 @@ program
   .option("--todo-file <path>", "Path to TODO file for HARD STOP checkpoints")
   .option("--hard-stop-token <text>", "Token that triggers a HARD STOP", DEFAULT_HARD_STOP_TOKEN)
   .option("--hard-stop-mode <mode>", "HARD STOP behavior: pause|exit", DEFAULT_HARD_STOP_MODE)
+  .option(
+    "--same-prompt-each-iteration",
+    "Use full prompt every iteration (Ralph Wiggum mode)",
+    DEFAULT_SAME_PROMPT_EACH_ITERATION
+  )
   .option("--cd <path>", "Workspace root")
   .option("--model <model>", "Codex model")
   .option("--profile <profile>", "Codex profile")
