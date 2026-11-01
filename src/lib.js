@@ -326,7 +326,9 @@ async function runCodexIteration({
   });
 
   if (eventsStream) {
-    eventsStream.close();
+    // Wait for buffered events to be flushed so the JSONL file is complete
+    // by the time the iteration result is returned.
+    await new Promise((resolve) => eventsStream.end(resolve));
   }
 
   currentChild = null;
