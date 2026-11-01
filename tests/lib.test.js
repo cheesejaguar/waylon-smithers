@@ -2,19 +2,15 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { EventEmitter } = require("events");
+const { PassThrough } = require("stream");
 
-// Mock child_process
+// Only the external `codex` CLI (a third-party LLM agent) is mocked; everything
+// else (filesystem, readline, prompt building, parsing) runs for real.
 jest.mock("child_process", () => ({
   spawn: jest.fn(),
 }));
 
-// Mock readline
-jest.mock("readline", () => ({
-  createInterface: jest.fn(),
-}));
-
 const { spawn } = require("child_process");
-const readline = require("readline");
 const lib = require("../src/lib");
 
 describe("lib.js", () => {
@@ -77,8 +73,9 @@ describe("lib.js", () => {
 
     test("uses cwd when workspaceRoot is null", () => {
       const result = lib.defaultLoopId(null);
-      // Match format: name-YYYY-MM-DDTHH-MM-SS (name can include hyphens)
-      expect(result).toMatch(/^[\w-]+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/);
+      const cwdName = path.basename(process.cwd());
+      expect(result.startsWith(`${cwdName}-`)).toBe(true);
+      expect(result.slice(cwdName.length + 1)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/);
     });
   });
 
@@ -131,9 +128,13 @@ describe("lib.js", () => {
     test("saves state with updated_at timestamp", () => {
       const statePath = path.join(tmpDir, "state.json");
       const state = { loop_id: "test-loop", status: "running" };
+      const before = Date.now();
       lib.saveState(state, statePath);
       const saved = lib.readJson(statePath);
-      expect(saved.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(saved.loop_id).toBe("test-loop");
+      expect(saved.status).toBe("running");
+      expect(saved.updated_at).toBe(state.updated_at);
+      expect(Date.parse(saved.updated_at)).toBeGreaterThanOrEqual(before - 1000);
     });
   });
 
@@ -614,112 +615,140 @@ describe("lib.js", () => {
   });
 
   describe("internal state management", () => {
-    test("_setCurrentChild and _setSigintReceived work", () => {
+    test("_setSigintReceived and _getSigintReceived round-trip", () => {
       lib._setSigintReceived(true);
       expect(lib._getSigintReceived()).toBe(true);
       lib._setSigintReceived(false);
       expect(lib._getSigintReceived()).toBe(false);
     });
-
-    test("_setCurrentChild sets current child", () => {
-      // Just verify it doesn't throw
-      lib._setCurrentChild(null);
-      lib._setCurrentChild({ kill: jest.fn() });
-      lib._setCurrentChild(null);
-    });
   });
 
   describe("registerSigintHandler", () => {
-    test("registers handler without error", () => {
-      // Just verify it doesn't throw
-      lib.registerSigintHandler(() => {});
+    let newListeners;
+
+    function registerAndCapture(onInterrupt) {
+      const before = process.listeners("SIGINT");
+      lib.registerSigintHandler(onInterrupt);
+      newListeners = process.listeners("SIGINT").filter((l) => !before.includes(l));
+      expect(newListeners).toHaveLength(1);
+      return newListeners[0];
+    }
+
+    afterEach(() => {
+      for (const l of newListeners || []) process.removeListener("SIGINT", l);
+      newListeners = [];
+      lib._setCurrentChild(null);
+      lib._setSigintReceived(false);
+    });
+
+    test("on SIGINT, forwards the signal to the running child and calls onInterrupt", () => {
+      const child = { kill: jest.fn() };
+      const onInterrupt = jest.fn();
+      lib._setCurrentChild(child);
+      lib._setSigintReceived(false);
+
+      const handler = registerAndCapture(onInterrupt);
+      handler();
+
+      expect(child.kill).toHaveBeenCalledWith("SIGINT");
+      expect(onInterrupt).toHaveBeenCalledTimes(1);
+      expect(lib._getSigintReceived()).toBe(true);
+    });
+
+    test("on SIGINT with no child and no callback, only records the interrupt", () => {
+      lib._setCurrentChild(null);
+      lib._setSigintReceived(false);
+
+      const handler = registerAndCapture(undefined);
+      expect(() => handler()).not.toThrow();
+      expect(lib._getSigintReceived()).toBe(true);
     });
   });
 
   describe("promptYesNo", () => {
-    test("returns true for y answer", async () => {
-      const mockRl = {
-        question: jest.fn((msg, cb) => cb("y")),
-        close: jest.fn(),
-      };
-      readline.createInterface.mockReturnValue(mockRl);
-
-      const result = await lib.promptYesNo("Continue?");
-      expect(result).toBe(true);
-      expect(mockRl.close).toHaveBeenCalled();
-    });
-
-    test("returns true for yes answer", async () => {
-      const mockRl = {
-        question: jest.fn((msg, cb) => cb("yes")),
-        close: jest.fn(),
-      };
-      readline.createInterface.mockReturnValue(mockRl);
-
-      const result = await lib.promptYesNo("Continue?");
-      expect(result).toBe(true);
-    });
-
-    test("returns false for n answer", async () => {
-      const mockRl = {
-        question: jest.fn((msg, cb) => cb("n")),
-        close: jest.fn(),
-      };
-      readline.createInterface.mockReturnValue(mockRl);
-
-      const result = await lib.promptYesNo("Continue?");
-      expect(result).toBe(false);
-    });
-
-    test("returns false for empty answer", async () => {
-      const mockRl = {
-        question: jest.fn((msg, cb) => cb("")),
-        close: jest.fn(),
-      };
-      readline.createInterface.mockReturnValue(mockRl);
-
-      const result = await lib.promptYesNo("Continue?");
-      expect(result).toBe(false);
-    });
-  });
-
-  describe("runCodexIteration", () => {
-    let mockChild;
-    let mockWriteStream;
+    let input;
+    let output;
+    let written;
 
     beforeEach(() => {
-      mockChild = new EventEmitter();
-      mockChild.stdout = new EventEmitter();
-      mockChild.stderr = new EventEmitter();
-      mockChild.kill = jest.fn();
-
-      mockWriteStream = {
-        write: jest.fn(),
-        close: jest.fn(),
-      };
-
-      spawn.mockReturnValue(mockChild);
-      jest.spyOn(fs, "createWriteStream").mockReturnValue(mockWriteStream);
+      input = new PassThrough();
+      output = new PassThrough();
+      written = "";
+      output.on("data", (d) => (written += d));
+      jest.spyOn(process, "stdin", "get").mockReturnValue(input);
+      jest.spyOn(process, "stdout", "get").mockReturnValue(output);
     });
 
     afterEach(() => {
       jest.restoreAllMocks();
     });
 
-    test("runs codex exec with prompt", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
+    async function answer(text) {
+      const pending = lib.promptYesNo("Continue?");
+      input.write(`${text}\n`);
+      return pending;
+    }
 
+    test("asks the question with a [y/N] suffix", async () => {
+      await answer("n");
+      expect(written).toContain("Continue? [y/N]: ");
+    });
+
+    test("returns true for y answer", async () => {
+      expect(await answer("y")).toBe(true);
+    });
+
+    test("returns true for yes answer, ignoring case and whitespace", async () => {
+      expect(await answer("  YeS  ")).toBe(true);
+    });
+
+    test("returns false for n answer", async () => {
+      expect(await answer("n")).toBe(false);
+    });
+
+    test("returns false for empty answer", async () => {
+      expect(await answer("")).toBe(false);
+    });
+
+    test("returns false for other text", async () => {
+      expect(await answer("yep")).toBe(false);
+    });
+  });
+
+  describe("runCodexIteration", () => {
+    let mockChild;
+    let lastMessagePath;
+    let stdoutWrites;
+    let stderrWrites;
+
+    beforeEach(() => {
+      mockChild = new EventEmitter();
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+      mockChild.kill = jest.fn();
+      spawn.mockReset();
+      spawn.mockReturnValue(mockChild);
+
+      lastMessagePath = path.join(tmpDir, "last.txt");
+      stdoutWrites = [];
+      stderrWrites = [];
+      jest.spyOn(process.stdout, "write").mockImplementation((t) => stdoutWrites.push(String(t)));
+      jest.spyOn(process.stderr, "write").mockImplementation((t) => stderrWrites.push(String(t)));
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    test("runs codex exec with prompt and builds the full argument list", async () => {
       const resultPromise = lib.runCodexIteration({
         prompt: "Do task",
         resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
         codexOptions: {
-          cd: "/workspace",
+          cd: tmpDir,
           model: "gpt-4",
           profile: "default",
           sandbox: "read-only",
@@ -727,123 +756,121 @@ describe("lib.js", () => {
         },
       });
 
-      // Simulate codex output
       mockChild.stdout.emit("data", Buffer.from('{"session_id": "test-session-123"}\n'));
       mockChild.emit("close", 0);
 
       const result = await resultPromise;
 
-      expect(spawn).toHaveBeenCalledWith(
-        "codex",
-        expect.arrayContaining(["exec", "Do task", "--json"]),
-        expect.any(Object)
-      );
-      expect(result.exitCode).toBe(0);
-      expect(result.sessionId).toBe("test-session-123");
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const [cmd, args, opts] = spawn.mock.calls[0];
+      expect(cmd).toBe("codex");
+      expect(args).toEqual([
+        "exec",
+        "Do task",
+        "--output-last-message",
+        lastMessagePath,
+        "--json",
+        "--cd",
+        tmpDir,
+        "--model",
+        "gpt-4",
+        "--profile",
+        "default",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+      ]);
+      expect(opts.cwd).toBe(tmpDir);
+      expect(result).toEqual({
+        exitCode: 0,
+        sessionId: "test-session-123",
+        stdout: '{"session_id": "test-session-123"}\n',
+        stderr: "",
+      });
+      // Codex output is streamed through to the user's terminal
+      expect(stdoutWrites.join("")).toBe('{"session_id": "test-session-123"}\n');
     });
 
-    test("runs codex exec resume with session id", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
+    test("runs codex exec resume with session id and prompt", async () => {
       const resultPromise = lib.runCodexIteration({
         prompt: "Continue",
         resumeSessionId: "existing-session-456",
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
-        codexOptions: { cd: "/workspace" },
+        codexOptions: {},
       });
 
       mockChild.emit("close", 0);
 
       const result = await resultPromise;
 
-      expect(spawn).toHaveBeenCalledWith(
-        "codex",
-        expect.arrayContaining(["exec", "resume", "existing-session-456", "Continue"]),
-        expect.any(Object)
-      );
+      expect(spawn.mock.calls[0][1]).toEqual([
+        "exec",
+        "resume",
+        "existing-session-456",
+        "Continue",
+        "--output-last-message",
+        lastMessagePath,
+        "--json",
+      ]);
+      // Falls back to the resumed session id when codex prints none
       expect(result.sessionId).toBe("existing-session-456");
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
     });
 
     test("runs codex exec resume without prompt", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
       const resultPromise = lib.runCodexIteration({
         prompt: null,
         resumeSessionId: "existing-session-789",
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
-        codexOptions: { cd: "/workspace" },
+        codexOptions: {},
       });
 
+      mockChild.emit("close", 0);
+      await resultPromise;
+
+      expect(spawn.mock.calls[0][1]).toEqual([
+        "exec",
+        "resume",
+        "existing-session-789",
+        "--output-last-message",
+        lastMessagePath,
+        "--json",
+      ]);
+    });
+
+    test("writes all stdout events to the jsonl file", async () => {
+      const jsonlPath = path.join(tmpDir, "events.jsonl");
+      const resultPromise = lib.runCodexIteration({
+        prompt: "Task",
+        resumeSessionId: null,
+        workspaceRoot: tmpDir,
+        lastMessagePath,
+        jsonlPath,
+        codexOptions: {},
+      });
+
+      mockChild.stdout.emit("data", Buffer.from('{"type":"a"}\n'));
+      mockChild.stdout.emit("data", Buffer.from('{"type":"b"}\n'));
+      mockChild.stderr.emit("data", Buffer.from("not an event\n"));
       mockChild.emit("close", 0);
 
       await resultPromise;
 
-      const spawnArgs = spawn.mock.calls[spawn.mock.calls.length - 1][1];
-      expect(spawnArgs).toContain("resume");
-      expect(spawnArgs).toContain("existing-session-789");
-      expect(spawnArgs).not.toContain(null);
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
+      expect(fs.readFileSync(jsonlPath, "utf8")).toBe('{"type":"a"}\n{"type":"b"}\n');
     });
 
-    test("writes to jsonl stream when path provided", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
+    test("captures stderr output and non-zero exit code", async () => {
       const resultPromise = lib.runCodexIteration({
         prompt: "Task",
         resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
-        jsonlPath: "/tmp/events.jsonl",
-        codexOptions: { cd: "/workspace" },
-      });
-
-      mockChild.stdout.emit("data", Buffer.from("event data"));
-      mockChild.emit("close", 0);
-
-      await resultPromise;
-
-      expect(fs.createWriteStream).toHaveBeenCalledWith("/tmp/events.jsonl");
-      expect(mockWriteStream.write).toHaveBeenCalledWith("event data");
-      expect(mockWriteStream.close).toHaveBeenCalled();
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
-    });
-
-    test("handles stderr output", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
-      const resultPromise = lib.runCodexIteration({
-        prompt: "Task",
-        resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
-        codexOptions: { cd: "/workspace" },
+        codexOptions: {},
       });
 
       mockChild.stderr.emit("data", Buffer.from("error output"));
@@ -853,47 +880,33 @@ describe("lib.js", () => {
 
       expect(result.stderr).toBe("error output");
       expect(result.exitCode).toBe(1);
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
+      expect(result.sessionId).toBeNull();
+      expect(stderrWrites.join("")).toBe("error output");
     });
 
     test("throws on spawn error", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
       const resultPromise = lib.runCodexIteration({
         prompt: "Task",
         resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
-        codexOptions: { cd: "/workspace" },
+        codexOptions: {},
       });
 
       mockChild.emit("error", new Error("spawn failed"));
 
       await expect(resultPromise).rejects.toThrow("spawn failed");
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
     });
 
     test("extracts session id from text when not in JSON", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
       const resultPromise = lib.runCodexIteration({
         prompt: "Task",
         resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
-        codexOptions: { cd: "/workspace" },
+        codexOptions: {},
       });
 
       mockChild.stdout.emit("data", Buffer.from("Session: 12345678-1234-1234-1234-123456789012\n"));
@@ -902,22 +915,33 @@ describe("lib.js", () => {
       const result = await resultPromise;
 
       expect(result.sessionId).toBe("12345678-1234-1234-1234-123456789012");
+    });
 
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
+    test("extracts session id from stderr text", async () => {
+      const resultPromise = lib.runCodexIteration({
+        prompt: "Task",
+        resumeSessionId: "old-session",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
+        jsonlPath: null,
+        codexOptions: {},
+      });
+
+      mockChild.stderr.emit("data", Buffer.from("session id: 0199a213-81c0-7800-8aa1-bbab2a035a53\n"));
+      mockChild.emit("close", 0);
+
+      const result = await resultPromise;
+
+      // A newly reported session id wins over the one being resumed
+      expect(result.sessionId).toBe("0199a213-81c0-7800-8aa1-bbab2a035a53");
     });
 
     test("includes all codex options in args", async () => {
-      const originalStdout = process.stdout.write;
-      const originalStderr = process.stderr.write;
-      process.stdout.write = jest.fn();
-      process.stderr.write = jest.fn();
-
       const resultPromise = lib.runCodexIteration({
         prompt: "Task",
         resumeSessionId: null,
-        workspaceRoot: "/workspace",
-        lastMessagePath: "/tmp/last.txt",
+        workspaceRoot: tmpDir,
+        lastMessagePath,
         jsonlPath: null,
         codexOptions: {
           cd: "/workspace",
@@ -933,22 +957,25 @@ describe("lib.js", () => {
       mockChild.emit("close", 0);
       await resultPromise;
 
-      const args = spawn.mock.calls[spawn.mock.calls.length - 1][1];
-      expect(args).toContain("--model");
-      expect(args).toContain("gpt-5");
-      expect(args).toContain("--profile");
-      expect(args).toContain("custom");
-      expect(args).toContain("--sandbox");
-      expect(args).toContain("workspace-write");
-      expect(args).toContain("--ask-for-approval");
-      expect(args).toContain("never");
-      expect(args).toContain("--full-auto");
-      expect(args).toContain("--skip-git-repo-check");
-      expect(args).toContain("--cd");
-      expect(args).toContain("/workspace");
-
-      process.stdout.write = originalStdout;
-      process.stderr.write = originalStderr;
+      expect(spawn.mock.calls[0][1]).toEqual([
+        "exec",
+        "Task",
+        "--output-last-message",
+        lastMessagePath,
+        "--json",
+        "--cd",
+        "/workspace",
+        "--model",
+        "gpt-5",
+        "--profile",
+        "custom",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "never",
+        "--full-auto",
+        "--skip-git-repo-check",
+      ]);
     });
   });
 });

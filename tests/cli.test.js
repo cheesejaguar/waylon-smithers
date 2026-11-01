@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { InvalidArgumentError } = require("commander");
 
 const cli = require("../src/cli");
 const lib = require("../src/lib");
@@ -49,8 +50,11 @@ describe("cli.js", () => {
 
       expect(logs.length).toBe(1);
       const outputState = JSON.parse(logs[0]);
-      expect(outputState.loop_id).toBe(loopId);
-      expect(outputState.status).toBe("running");
+      expect(outputState).toEqual(state);
+    });
+
+    test("throws when the state file is missing", () => {
+      expect(() => cli.handleStatus({ loopId: "missing", cd: tmpDir })).toThrow("State file not found");
     });
   });
 
@@ -99,6 +103,9 @@ describe("cli.js", () => {
 
       const output = logs.join("\n");
       expect(output).toContain("Loops in this workspace:");
+      // Most recently updated loop is listed first
+      expect(output.indexOf("loop-2")).toBeLessThan(output.indexOf("loop-1"));
+      expect(output).toContain("Iteration: 2/20");
       expect(output).toContain("loop-1");
       expect(output).toContain("loop-2 [ralph]");
       expect(output).toContain("Status: completed");
@@ -124,7 +131,18 @@ describe("cli.js", () => {
 
       const output = JSON.parse(logs[0]);
       expect(Array.isArray(output)).toBe(true);
-      expect(output[0].loop_id).toBe("json-loop");
+      expect(output).toEqual([
+        {
+          loop_id: "json-loop",
+          status: "running",
+          iteration: 1,
+          max_iterations: 5,
+          created_at: "2024-01-01T00:00:00.000Z",
+          updated_at: "2024-01-01T00:30:00.000Z",
+          completion_promise: "DONE",
+          same_prompt_each_iteration: false,
+        },
+      ]);
     });
 
     test("skips malformed state files", () => {
@@ -207,18 +225,19 @@ describe("cli.js", () => {
   });
 
   describe("installHelpers", () => {
-    let originalHomedir;
     let fakeHome;
 
+    // Redirect the home directory to a temp dir; files are still really written
+    // and read back. (Jest sandboxes process.env, so setting HOME does not reach
+    // os.homedir().)
     beforeEach(() => {
       fakeHome = path.join(tmpDir, "home");
       fs.mkdirSync(fakeHome, { recursive: true });
-      originalHomedir = os.homedir;
-      os.homedir = () => fakeHome;
+      jest.spyOn(os, "homedir").mockReturnValue(fakeHome);
     });
 
     afterEach(() => {
-      os.homedir = originalHomedir;
+      jest.restoreAllMocks();
     });
 
     test("installs prompt and skill helpers", () => {
@@ -234,8 +253,13 @@ describe("cli.js", () => {
       expect(promptContent).toContain("test-loop");
       expect(promptContent).toContain("DONE");
 
+      expect(promptContent).toBe(lib.renderPromptHelper("test-loop", "DONE"));
       const skillContent = fs.readFileSync(skillPath, "utf8");
-      expect(skillContent).toContain("DONE");
+      expect(skillContent).toBe(lib.renderSkillHelper("DONE"));
+      expect(logs).toEqual([
+        `Installed prompt helper at ${promptPath}`,
+        `Installed skill helper at ${skillPath}`,
+      ]);
     });
 
     test("uses defaults when options not provided", () => {
@@ -254,7 +278,8 @@ describe("cli.js", () => {
     });
 
     test("throws InvalidArgumentError for invalid input", () => {
-      expect(() => cli.cliParseInteger("abc")).toThrow();
+      expect(() => cli.cliParseInteger("abc")).toThrow(InvalidArgumentError);
+      expect(() => cli.cliParseInteger("0")).toThrow("Value must be a positive integer.");
     });
   });
 });
